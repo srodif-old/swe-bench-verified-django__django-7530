@@ -641,6 +641,64 @@ class MakeMigrationsTests(MigrationTestBase):
                 allow_migrate.assert_called_with('other', 'migrations', model_name='UnicodeModel')
                 self.assertEqual(ensure_schema.call_count, 4)
 
+    def test_makemigrations_router_calls_correct_app_model_pairs(self):
+        """
+        Test that makemigrations consistency checks call router.allow_migrate()
+        with correct (app_label, model) pairs. This is a regression test for
+        the bug where apps.get_models(app_label) was incorrectly used, causing
+        router.allow_migrate() to be called with models from all apps for each app_label.
+        """
+        # Create a router that tracks all allow_migrate calls
+        class TrackingRouter:
+            def __init__(self):
+                self.calls = []
+            
+            def allow_migrate(self, db, app_label, **hints):
+                model_name = hints.get('model_name', 'Unknown')
+                self.calls.append((db, app_label, model_name))
+                return True
+        
+        tracking_router = TrackingRouter()
+        
+        # Register a model for testing
+        apps.register_model('migrations', UnicodeModel)
+        
+        # Mock to avoid actually checking migration history
+        def mock_check_history(connection):
+            pass
+        
+        with self.settings(DATABASE_ROUTERS=[tracking_router]):
+            with mock.patch('django.db.migrations.loader.MigrationLoader.check_consistent_history', mock_check_history):
+                with self.temporary_migration_module() as migration_dir:
+                    call_command('makemigrations', 'migrations', verbosity=0)
+        
+        # Filter calls related to our test app
+        relevant_calls = [(db, app_label, model_name) for db, app_label, model_name 
+                         in tracking_router.calls if app_label == 'migrations']
+        
+        # Verify that all calls have correct (app_label, model) pairs
+        incorrect_calls = []
+        for db, app_label, model_name in relevant_calls:
+            # For the migrations app, the model should actually be from migrations app
+            try:
+                # Verify that the model exists and is from the correct app
+                model = apps.get_model(app_label, model_name)
+                actual_app_label = model._meta.app_label
+                if actual_app_label != app_label:
+                    incorrect_calls.append((db, app_label, model_name, actual_app_label))
+            except LookupError:
+                # Model doesn't exist in the specified app - this is also wrong
+                incorrect_calls.append((db, app_label, model_name, 'NOT_FOUND'))
+        
+        # Assert that all calls were correct
+        self.assertEqual(incorrect_calls, [], 
+                        "router.allow_migrate() was called with incorrect (app_label, model) pairs. "
+                        f"Incorrect calls: {incorrect_calls}")
+        
+        # Also verify that we made some calls (test didn't get skipped)
+        self.assertGreater(len(relevant_calls), 0, 
+                          "Expected router.allow_migrate() to be called at least once for the migrations app")
+
     def test_failing_migration(self):
         # If a migration fails to serialize, it shouldn't generate an empty file. #21280
         apps.register_model('migrations', UnserializableModel)
